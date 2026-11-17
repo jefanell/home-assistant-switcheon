@@ -13,10 +13,13 @@ folder in your Home Assistant configuration directory. Restart Home Assistant,
 then go to **Settings → Devices & Services → Add Integration**, search for
 **SwitcheOn**, and enter the email and password used by the SwitcheOn phone app.
 
-The integration polls account data every two minutes to keep online status
-current and maintains a SignalR websocket for real-time box check-ins. SwitcheOn
-login tokens last eight hours; the integration logs in again when the account
-request indicates that a token has expired. Credentials are stored by Home
+The integration does not poll. Box state, temperature and online status come
+from SwitcheOn's SignalR websocket as each box checks in. The account is read
+over REST only at startup, after the websocket reconnects, and when an online
+box has been silent for 13 minutes (the server marks a box offline after 11),
+to confirm it went offline. If the server still reports such a box online, the
+websocket has stopped delivering updates and is reconnected. SwitcheOn login
+tokens last eight hours; the integration renews them before they expire. Credentials are stored by Home
 Assistant in the config entry.
 
 ## Entities
@@ -34,8 +37,9 @@ For each box present when the integration is first set up, it creates:
 - The API uses `currentStatus` as reported state; `pendingStatus` is only a
   request waiting to be applied. The integration converts the bitmask to
   separate channel switches.
-- Online/offline state is obtained from account polling because SwitcheOn does
-  not push online changes.
+- SwitcheOn does not push online/offline changes. A check-in marks a box
+  online immediately; going offline is confirmed with one account read after
+  13 minutes without a check-in.
 - Boxes added to the account after integration setup require reloading the
   integration to create their entities.
 - API reference: https://github.com/SeanMollet/SwitcheOn-API

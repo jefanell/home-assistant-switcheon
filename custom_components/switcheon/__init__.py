@@ -23,7 +23,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await hass.config_entries.async_forward_entry_setups(
         entry, [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.SWITCH]
     )
-    coordinator.start_websocket()
+    coordinator.async_start(entry)
     return True
 
 

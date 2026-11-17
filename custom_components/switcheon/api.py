@@ -4,11 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Any
 
-from aiohttp import ClientError, ClientSession
+from aiohttp import ClientError, ClientSession, WSMsgType
 
 from .const import API_BASE
+
+
+WS_URL = "https://www.switcheon.com/api/userhub"
+# Tokens last eight hours; renew a little early so a reconnect never registers with
+# an expired one.
+TOKEN_RENEW_SECONDS = 8 * 3600 - 10 * 60
+# The server drops a connection it hasn't heard from in 30 seconds, even while it is
+# sending updates, so ping on a fixed schedule rather than only when idle.
+PING_INTERVAL = 15
+RECORD_SEPARATOR = "\x1e"
+PING = '{"type":6}' + RECORD_SEPARATOR
 
 
 class SwitcheOnApiError(Exception):
@@ -24,6 +36,7 @@ class SwitcheOnApi:
         self._password = password
         self._user_id: str | None = None
         self._token: str | None = None
+        self._token_renew_at = 0.0
         self.account: dict[str, Any] = {}
 
     async def _login(self) -> None:
@@ -40,12 +53,16 @@ class SwitcheOnApi:
             raise SwitcheOnApiError("cannot_connect") from err
         self._user_id = result["userIdBin"]
         self._token = result["token"]
+        self._token_renew_at = time.monotonic() + TOKEN_RENEW_SECONDS
+
+    async def _ensure_login(self) -> None:
+        if self._token is None or self._user_id is None or time.monotonic() >= self._token_renew_at:
+            await self._login()
 
     async def async_get_boxes(self) -> list[dict[str, Any]]:
         """Return account boxes, logging in again if the token was rejected."""
         for attempt in range(2):
-            if self._token is None or self._user_id is None:
-                await self._login()
+            await self._ensure_login()
             try:
                 async with self._session.get(
                     f"{API_BASE}/User",
@@ -73,6 +90,7 @@ class SwitcheOnApi:
             current = box.get("currentStatus") or 0
         bit = 1 << channel
         requested = current | bit if turn_on else current & ~bit
+        await self._ensure_login()
         try:
             async with self._session.put(
                 f"{API_BASE}/req",
@@ -92,48 +110,57 @@ class SwitcheOnApi:
             raise SwitcheOnApiError("cannot_connect") from err
         return requested
 
-    async def async_listen(self, on_update) -> None:
-        """Connect to SignalR JSON protocol and forward box check-ins."""
-        if self._token is None or self._user_id is None:
-            await self._login()
-        async with self._session.ws_connect("https://www.switcheon.com/api/userhub", heartbeat=None) as ws:
-            await ws.send_str('{"protocol":"json","version":1}\x1e')
+    async def async_listen(self, on_update, on_connected=None) -> None:
+        """Connect to the SignalR hub and forward every box update until it closes.
+
+        Check-ins (``req`` is null) and request echoes (``req`` set) are both
+        forwarded; the caller tells them apart. ``on_connected`` is called once
+        the registration is accepted.
+        """
+        await self._ensure_login()
+        loop = asyncio.get_running_loop()
+        async with self._session.ws_connect(WS_URL, heartbeat=None) as ws:
+            await ws.send_str('{"protocol":"json","version":1}' + RECORD_SEPARATOR)
             handshake = await ws.receive(timeout=15)
-            if handshake.type.name != "TEXT" or '"error"' in handshake.data:
+            if handshake.type != WSMsgType.TEXT or '"error"' in handshake.data:
                 raise SwitcheOnApiError("websocket_handshake_failed")
             await ws.send_str(json.dumps({
                 "type": 1,
                 "invocationId": "1",
                 "target": "registerConnectionSecure",
                 "arguments": [self._user_id, self._token],
-            }) + "\x1e")
+            }) + RECORD_SEPARATOR)
+            last_sent = loop.time()
             registered = False
             while True:
+                if loop.time() - last_sent >= PING_INTERVAL:
+                    await ws.send_str(PING)
+                    last_sent = loop.time()
                 try:
-                    message = await ws.receive(timeout=15)
+                    message = await ws.receive(timeout=PING_INTERVAL - (loop.time() - last_sent))
                 except asyncio.TimeoutError:
-                    await ws.send_str('{"type":6}\x1e')
                     continue
-                if message.type.name in ("CLOSED", "CLOSE", "ERROR"):
+                if message.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED, WSMsgType.ERROR):
                     return
-                if message.type.name != "TEXT":
+                if message.type != WSMsgType.TEXT:
                     continue
-                for item in message.data.split("\x1e"):
+                for item in message.data.split(RECORD_SEPARATOR):
                     if not item:
                         continue
                     payload = json.loads(item)
-                    if payload.get("type") == 3 and payload.get("invocationId") == "1":
+                    kind = payload.get("type")
+                    if kind == 3 and payload.get("invocationId") == "1":
                         if payload.get("error"):
+                            # Most likely a rejected token; log in afresh on the next attempt.
+                            self._token = None
                             raise SwitcheOnApiError("websocket_registration_failed")
                         registered = True
-                    elif payload.get("type") == 6:
-                        await ws.send_str('{"type":6}\x1e')
-                    elif payload.get("type") == 7:
+                        if on_connected is not None:
+                            on_connected()
+                    elif kind == 7:
                         return
-                    elif payload.get("type") == 1 and payload.get("target") == "updateFromServer":
-                        if not registered:
-                            continue
-                        raw = payload.get("arguments", [None])[0]
+                    elif kind == 1 and registered and payload.get("target") == "updateFromServer":
+                        raw = (payload.get("arguments") or [None])[0]
                         update = json.loads(raw) if isinstance(raw, str) else raw
-                        if isinstance(update, dict) and "req" not in update and update.get("BoxIdBin"):
+                        if isinstance(update, dict) and update.get("BoxIdBin"):
                             on_update(update)

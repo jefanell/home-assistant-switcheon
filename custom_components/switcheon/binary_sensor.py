@@ -16,7 +16,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
 
 class SwitcheOnOnlineSensor(SwitcheOnBoxEntity, BinarySensorEntity):
-    """Whether the box is reporting online according to account polling."""
+    """Whether the box is checking in: set by live check-ins, cleared when the server marks it offline."""
 
     _attr_has_entity_name = True
     _attr_name = "Online"
